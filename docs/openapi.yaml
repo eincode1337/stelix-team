@@ -1,0 +1,2851 @@
+openapi: 3.1.0
+
+info:
+  title: Stelix Team - Internal HTTP API
+  version: "1.0.0"
+  description: |
+    HTTP contract for every `/api/*` endpoint used by the Stelix Team
+    web application.
+
+    ## Conventions
+    - **Session auth** is a cookie set by the login flow. Endpoints that require it
+      declare `security: [{ cookieAuth: [] }]`; public endpoints declare
+      `security: []`.
+    - **`backgroundFetchInit`** - background/polling GETs send the request header
+      `x-stelix-skip-global-slow-fetch: 1`, whose only effect is suppressing the
+      global top-of-page slow-fetch loader. It is documented per-operation as the
+      optional header `X-Stelix-Skip-Global-Slow-Fetch`.
+    - **HTTP 423 (Locked)** is returned by commerce write endpoints when the
+      `purchasesDisabled` (or related) site-feature-lock is active, with body
+      `{ "error": string }`.
+    - **Error bodies** are parsed defensively by the client
+      (`res.json().catch(() => ({}))`), so all error fields are optional.
+    - **Resource images** are relative paths (e.g. `coverImage:
+      "/resource-images/xxx.webp"`) served from the CDN base
+      `https://cdn.stelix.team` (i.e. full URL = `https://cdn.stelix.team` + path).
+
+servers:
+  - url: https://stelix.team
+    description: Production site (same-origin as the web app)
+
+tags:
+  - name: auth
+    description: Authentication, session, login code + PIN, balance polling.
+  - name: profile
+    description: Current-user profile, settings, language, OAuth linking, consent.
+  - name: commerce
+    description: Cart, orders, resources catalog, combos, checkout methods, purchases, payment status.
+  - name: subscriptions
+    description: Buyer memberships and seller subscription offerings/plans.
+  - name: notifications
+    description: In-app notifications and site-news unread indicators.
+  - name: admin
+    description: >-
+      Admin panel - paginated tables (users, access, sellers, orders, purchases,
+      resources, withdrawals, applications, blacklist, deliveries, reviews),
+      dashboard stats + finance, session termination, impersonation,
+      service-account elevation, and staff user pickers.
+  - name: webhooks
+    description: Server-to-server payment provider callbacks (not browser-called).
+  - name: misc
+    description: Health, geo, feature locks, chat settings, tracking, presence, search.
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: |
+        Session cookie issued by the login flow. The exact cookie name is
+        server-defined and opaque to the client.
+
+  parameters:
+    SkipSlowFetchHeader:
+      name: X-Stelix-Skip-Global-Slow-Fetch
+      in: header
+      required: false
+      description: Set to "1" on background/polling requests to suppress the global slow-fetch loader.
+      schema:
+        type: string
+        enum: ["1"]
+
+    # --- Shared admin list-table query params (parseListParams) ---------------
+    AdminListPage:
+      name: page
+      in: query
+      required: false
+      description: 1-based page index (clamped to >= 1; default 1).
+      schema: { type: integer, minimum: 1, default: 1 }
+    AdminListPageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: Rows per page (clamped 1..100; default 20).
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    AdminListQ:
+      name: q
+      in: query
+      required: false
+      description: Free-text search (trimmed; case-insensitive) across the table's text columns.
+      schema: { type: string }
+    AdminListStatus:
+      name: status
+      in: query
+      required: false
+      description: Filter by the table's status/type column (case-insensitive; enum is per-table).
+      schema: { type: string }
+    AdminListRole:
+      name: role
+      in: query
+      required: false
+      description: Filter by role code (case-insensitive). See RoleCode.
+      schema: { $ref: "#/components/schemas/RoleCode" }
+
+  responses:
+    Unauthorized:
+      description: Not authenticated. The client treats this as logged-out.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    Locked:
+      description: Feature locked (e.g. `purchasesDisabled` site-feature-lock active). Shown as a warning toast.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    RateLimited:
+      description: Too many requests.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/ErrorBody"
+              - type: object
+                properties:
+                  retryAfterSec:
+                    type: number
+                    description: Seconds to wait before retrying. Falls back to the `Retry-After` header (default 60).
+
+  schemas:
+
+    ErrorBody:
+      type: object
+      description: Generic error body. All fields optional (parsed with a catch fallback of `{}`).
+      properties:
+        error:
+          type: string
+          description: Human-readable message; often shown verbatim.
+        code:
+          type: string
+          description: Machine error code (endpoint-specific enum).
+        retryAfterSec:
+          type: number
+          description: Present on rate-limit responses.
+      additionalProperties: true
+
+    User:
+      type: object
+      description: |
+        The current user. `/api/auth/me` returns `{ user: User | null }` - `null`
+        when unauthenticated (confirmed by fixture). The exhaustive field list is
+        taken from the `USER_UPDATE_EVENT` reducer in the client AuthProvider, so
+        most fields are opaque.
+      properties:
+        id: { type: string }
+        email: { type: string }
+        emailVerified:
+          type: [string, "null"]
+          description: Date-ish; client coerces `?? null`.
+        name: { type: string }
+        role:
+          type: [string, number]
+          description: e.g. USER / MODERATOR / SECURITY / DEVELOPER / AGENT / ACCOUNTANT.
+        status: { type: number }
+        balance: { type: number }
+        payable: { type: number }
+        language:
+          type: string
+          description: "'ru' | 'uk' | 'en'."
+        image: { type: [string, "null"] }
+        site: { type: [string, "null"] }
+        pendingSite: { type: [string, "null"] }
+        sellerEmail: { type: [string, "null"] }
+        hasPinSet: { type: boolean, description: Read by the PIN gate. }
+        impersonating: { type: boolean }
+        serviceAccount: { type: boolean, description: }
+        legalAcceptedAt:
+          type: [string, "null"]
+          description: Gates the platform-welcome consent flow.
+        tourDoneAt: { type: [string, "null"] }
+        resourceTourDoneAt: { type: [string, "null"] }
+        discordId: { type: [string, "null"] }
+        discordDisplayName: { type: [string, "null"] }
+        steamId: { type: [string, "null"] }
+        steamDisplayName: { type: [string, "null"] }
+        googleId: { type: [string, "null"] }
+        googleDisplayName: { type: [string, "null"] }
+        githubId: { type: [string, "null"] }
+        githubLogin: { type: [string, "null"] }
+        githubDisplayName: { type: [string, "null"] }
+        telegramId: { type: [string, "null"] }
+        telegramUsername: { type: [string, "null"] }
+        telegramDisplayName: { type: [string, "null"] }
+        notificationSoundEnabled: { type: boolean }
+        purchaseSoundEnabled: { type: boolean }
+        purchaseNotificationsChannels:
+          description: string[] or object.
+          oneOf:
+            - type: array
+              items: { type: string }
+            - type: object
+              additionalProperties: true
+      additionalProperties: true
+
+    Balance:
+      type: object
+      properties:
+        balance: { type: number }
+        payable:
+          type: number
+          description: Optional; defaults to 0 if not a number.
+      required: [balance]
+
+    SendCodeRequest:
+      type: object
+      properties:
+        email: { type: string }
+        siteLanguage: { type: string, description: Current UI language. }
+      required: [email, siteLanguage]
+
+    SendCodeResponse:
+      type: object
+      properties:
+        devHint:
+          type: string
+          description: Optional dev/testing hint text; shown verbatim if non-empty, else an i18n default.
+
+    VerifyCodeRequest:
+      type: object
+      properties:
+        email: { type: string }
+        code:
+          type: string
+          description: 6 chars, uppercased, [A-Za-z0-9] with separators stripped.
+      required: [email, code]
+
+    ProfileSettings:
+      type: object
+      description: Profile settings object. Only `hidePersonalData` is read by the client; other fields are opaque.
+      properties:
+        hidePersonalData: { type: boolean }
+      additionalProperties: true
+
+    LanguagePatchRequest:
+      type: object
+      properties:
+        language:
+          type: string
+          description: "'ru' | 'uk' | 'en'."
+        ensureOnly:
+          type: boolean
+          description: When true, only set the language if not already set (default false).
+      required: [language]
+
+    PlatformWelcomeRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          description: Observed value "acceptLegal".
+          examples: ["acceptLegal"]
+      required: [action]
+
+    PinVerifyRequest:
+      type: object
+      properties:
+        pin: { type: string, description: 6 chars. }
+      required: [pin]
+
+    PinVerifyError:
+      allOf:
+        - $ref: "#/components/schemas/ErrorBody"
+        - type: object
+          properties:
+            attemptsLeft:
+              type: number
+              description: ">0 → 'wrong PIN, N attempts left'."
+            code:
+              type: string
+              description: e.g. "pin_rate_limit".
+
+    GeoCountry:
+      type: object
+      description: Real captured shape (fixture geo-country.json).
+      x-source: fixture
+      properties:
+        countryCode:
+          type: [string, "null"]
+          description: Trimmed + uppercased ISO country code; mapped to a currency, falls back to "RUB".
+        isRussia: { type: boolean }
+      required: [countryCode, isRussia]
+
+    CartItem:
+      type: object
+      properties:
+        id: { type: string }
+        quantity: { type: number }
+        deferred:
+          type: boolean
+          description: false → active bucket, true → "saved for later".
+        price: { type: number, description: used for cart total (price*quantity). }
+        maxQuantity: { type: number, description: clamps quantity to 1..min(99,maxQuantity). }
+        addedAt: { type: string, format: date-time, description: }
+      required: [id, quantity, deferred]
+      additionalProperties: true
+
+    Cart:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CartItem" }
+
+    CartSummary:
+      type: object
+      properties:
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              quantity: { type: number }
+              deferred: { type: boolean }
+        activeUnits:
+          type: number
+          description: Total non-deferred units; client recomputes if absent/invalid.
+
+    Order:
+      type: object
+      description: Custom-order (commission). Real captured shape (fixture orders.json).
+      x-source: fixture
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        budget: { type: number }
+        deadline: { type: string, format: date-time }
+        category: { type: string, description: e.g. integration | design | optimization | other. }
+        status: { type: string, description: e.g. "completed". }
+        rawStatus: { type: string, description: e.g. "COMPLETED". }
+        displayPhase: { type: string }
+        disputeActive: { type: boolean }
+        client: { type: string, description: client username. }
+        clientId: { type: number }
+        seller: { type: string, description: seller username. }
+        sellerId: { type: number }
+        amountFromPayment: { type: number }
+        amountFromBalance: { type: number }
+        responsesCount: { type: number }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        sellerDeliveredAt: { type: [string, "null"], format: date-time }
+        clientConfirmedAt: { type: [string, "null"], format: date-time }
+        clientAvatarUrl: { type: [string, "null"] }
+        clientSlug: { type: string }
+      required: [id, title, description, budget, category, status]
+
+    OrderCreateRequest:
+      type: object
+      properties:
+        title: { type: string, description: trimmed. }
+        description: { type: string, description: trimmed. }
+        budget: { type: number, description: parseInt; must be >= ORDER_BUDGET_MIN. }
+        category: { type: string }
+        deadline: { type: string, description: date; must be after today (local). }
+        legalAccept: { type: boolean, enum: [true] }
+      required: [title, description, budget, category, deadline, legalAccept]
+
+    Resource:
+      type: object
+      description: Catalog resource. Real captured shape (fixture resources.json).
+      x-source: fixture
+      properties:
+        id: { type: string }
+        slug: { type: string }
+        title: { type: string }
+        description: { type: string }
+        shortDescription: { type: string }
+        price: { type: number }
+        discount: { type: number }
+        category: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        images:
+          type: array
+          items: { type: string, description: Path under the CDN base (https://cdn.stelix.team). }
+        coverImage: { type: string, description: Path under the CDN base. }
+        authorId: { type: number }
+        author: { type: string }
+        authorRole: { type: string, description: e.g. SELLER_PLUS. }
+        status: { type: string, description: e.g. APPROVED. }
+        sales: { type: number }
+        downloads: { type: number }
+        listingKind: { type: string, description: PAID | FREE. }
+        uniqueViews: { type: number }
+        deliverySource: { type: string, description: e.g. "discord". }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: [string, "null"], format: date-time }
+        lastBuyerUpdateAt: { type: [string, "null"], format: date-time }
+        buyerUpdatesCount: { type: number }
+        createdWithAiTools: { type: boolean }
+        reviewsCount: { type: number }
+        rating: { type: number }
+        authorReviewsCount: { type: number }
+        authorRating: { type: number }
+        viewerLastViewedAt:
+          type: [string, "null"]
+          format: date-time
+          description: merged from /api/resources/catalog-viewed for authenticated viewers.
+      required: [id, slug, title, price, category]
+      additionalProperties: true
+
+    ResourceList:
+      type: object
+      description: Real captured shape (fixture resources.json).
+      x-source: fixture
+      properties:
+        resources:
+          type: array
+          items: { $ref: "#/components/schemas/Resource" }
+        listingKindCounts:
+          type: object
+          properties:
+            paid: { type: number }
+            free: { type: number }
+
+    CatalogViewedRequest:
+      type: object
+      properties:
+        ids:
+          type: array
+          items: { type: string }
+          description: Resource ids currently on screen.
+      required: [ids]
+
+    CatalogViewedResponse:
+      type: object
+      properties:
+        viewed:
+          type: object
+          description: Map of resourceId → ISO timestamp of the viewer's last view. May be `{}`.
+          additionalProperties: { type: string, format: date-time }
+
+    ComboItem:
+      type: object
+      description: A resource included in a combo. Real captured shape (fixture combos.json).
+      x-source: fixture
+      properties:
+        resourceId: { type: string }
+        discountType: { type: string, description: e.g. "percent". }
+        discountValue: { type: number }
+        discountPercent: { type: number }
+        addedByUserId: { type: number }
+        title: { type: string }
+        slug: { type: string }
+        coverUrl: { type: [string, "null"], description: Path under the CDN base, or null. }
+        price: { type: number }
+        discountedPrice: { type: number }
+        authorId: { type: number }
+        authorName: { type: string }
+        category: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        sales: { type: number }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Combo:
+      type: object
+      description: A bundle of resources. Real captured shape (fixture combos.json).
+      x-source: fixture
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        coverImage: { type: string, description: Path under the CDN base. }
+        catalogImage: { type: string, description: Path under the CDN base. }
+        thumbnailImage: { type: string, description: Path under the CDN base (may be ""). }
+        createdByUserId: { type: number }
+        createdAt: { type: string, format: date-time }
+        members:
+          type: array
+          items: { type: object, additionalProperties: true }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ComboItem" }
+        sales: { type: number }
+        uniqueViews: { type: number }
+        totalRevenueRubles: { type: number }
+        totalPrice: { type: number }
+        totalOldPrice: { type: number }
+        discountPercent: { type: number }
+        price: { type: number, description: read by the client. }
+        discountedPrice: { type: number, description: read by the client. }
+        priceFrom: { type: number, description: read by the client. }
+        priceTo: { type: number, description: read by the client. }
+        viewerLastViewedAt: { type: [string, "null"], format: date-time, description: }
+      required: [id, title, items]
+      additionalProperties: true
+
+    ComboList:
+      type: object
+      x-source: fixture
+      properties:
+        combos:
+          type: array
+          items: { $ref: "#/components/schemas/Combo" }
+
+    ComboBalanceRequest:
+      type: object
+      properties:
+        legalAccept: { type: boolean, enum: [true] }
+        serversByResourceId:
+          type: object
+          description: Optional; when the combo needs game servers. Map resourceId → server.
+          additionalProperties: { type: string }
+        domainsByResourceId:
+          type: object
+          description: Optional; when the combo needs domains. Map resourceId → domain.
+          additionalProperties: { type: string }
+      required: [legalAccept]
+
+    ComboBalanceResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        error: { type: string }
+      required: [ok]
+
+    ComboCheckoutMetaRequest:
+      type: object
+      properties:
+        serversByResourceId:
+          type: object
+          additionalProperties: { type: string }
+        domainsByResourceId:
+          type: object
+          additionalProperties: { type: string }
+
+    ComboViewResponse:
+      type: object
+      properties:
+        uniqueViews: { type: number }
+
+    KassaMethod:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        available: { type: boolean }
+        commissionMinPct: { type: number }
+        commissionMaxPct: { type: number }
+        paymentIcons:
+          type: array
+          items: { type: string }
+          description: Icon ids/urls, cycled in the card logo.
+        kassaName: { type: string, description: Gateway/kassa label shown in parens. }
+        unavailableReason: { type: string, description: Shown when not available. }
+      required: [id, name, available]
+
+    Kassa:
+      type: object
+      properties:
+        methods:
+          type: array
+          items: { $ref: "#/components/schemas/KassaMethod" }
+        usdRubRate: { type: [number, "null"] }
+        usdtRubRate: { type: [number, "null"] }
+        exchangeRates:
+          type: object
+          description: Map of uppercase currency code → positive finite rate.
+          additionalProperties: { type: number }
+
+    Subscription:
+      type: object
+      description: Buyer subscription. Core fields from code; shape cross-referenced with seller-API docs.
+      properties:
+        id: { type: string }
+        status: { type: string, description: e.g. "active". }
+        startedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        remainDays: { type: number }
+        autoRenew: { type: boolean }
+        periodMonths: { type: number }
+        priceRubles:
+          type: number
+          description: a.k.a. `priceRub` (alias - code uses priceRub, docs use priceRubles).
+      additionalProperties: true
+
+    Plan:
+      type: object
+      properties:
+        id: { type: string }
+        months: { type: number }
+        priceRubles: { type: number }
+
+    Offering:
+      type: object
+      description: Seller subscription offering. The editor POST body is opaque.
+      properties:
+        id: { type: string }
+        serviceId: { type: string }
+        published: { type: boolean }
+        plans:
+          type: array
+          items: { $ref: "#/components/schemas/Plan" }
+        service:
+          type: object
+          properties:
+            id: { type: string }
+            title: { type: string }
+      additionalProperties: true
+
+    MembershipsResponse:
+      type: object
+      properties:
+        subscriptions:
+          type: array
+          items: { $ref: "#/components/schemas/Subscription" }
+        offerings:
+          type: array
+          items: { $ref: "#/components/schemas/Offering" }
+        trialUsedOfferingIds:
+          type: array
+          items: { type: string }
+
+    OfferingsResponse:
+      type: object
+      description: Real captured shape (fixture subscriptions-offerings.json → `{"offerings":[]}`).
+      x-source: fixture
+      properties:
+        offerings:
+          type: array
+          items: { $ref: "#/components/schemas/Offering" }
+
+    SubscribeRequest:
+      type: object
+      properties:
+        serviceId: { type: string }
+        planId: { type: string }
+        autoRenew: { type: boolean }
+      required: [serviceId, planId, autoRenew]
+
+    Purchase:
+      type: object
+      description: Partial - only cover/thumbnail fields are consumed by the client.
+      properties:
+        resource:
+          type: object
+          properties:
+            images:
+              type: array
+              items: { type: string }
+            thumbnailImage: { type: [string, "null"] }
+            cover: { type: [string, "null"], description: }
+
+    DepositStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          description: "\"completed\" | \"failed\" | (pending otherwise)."
+        redirectTo:
+          type: string
+          description: Navigated to when status === "completed".
+
+    Notification:
+      type: object
+      properties:
+        id: { type: number, description: ">0; used as read-tracking key via String(id)." }
+        type:
+          type: string
+          description: Observed values purchase | seller_purchase | buyer_purchase | chat_message.
+        link: { type: string, description: App-relative path (starts with "/"). }
+        title: { type: string }
+        body:
+          type: [string, "null"]
+          description: JSON-encoded purchase payload when it starts with "{" (see PurchaseNotificationBody).
+        isRead: { type: boolean }
+        createdAt: { type: [string, number], description: timestamp. }
+      required: [id, type, title, isRead]
+
+    PurchaseNotificationBody:
+      type: object
+      description: Parsed from Notification.body when present and starting with "{".
+      properties:
+        kind: { type: string, enum: [purchase_v1] }
+        resourceId: { type: string }
+        resourceTitle: { type: string }
+        purchaseId: { type: string, description: optional. }
+      required: [kind, resourceId, resourceTitle]
+
+    NotificationsResponse:
+      type: object
+      properties:
+        notifications:
+          type: array
+          items: { $ref: "#/components/schemas/Notification" }
+        total:
+          type: number
+          description: Falls back to notifications.length if absent.
+
+    NotificationsReadRequest:
+      type: object
+      description: "Mark specific ids, or `{}` to mark ALL as read."
+      properties:
+        ids:
+          type: array
+          items: { type: number }
+
+    SiteNewsUnread:
+      type: object
+      properties:
+        unreadCount: { type: number, description: Defaults to 0 if missing. }
+
+    UserLocks:
+      type: object
+      properties:
+        reviewsDisabled: { type: boolean }
+        purchasesDisabled: { type: boolean }
+        ordersDisabled: { type: boolean }
+        withdrawalsDisabled: { type: boolean }
+        resourceCreationDisabled: { type: boolean }
+        paymentsDisabled: { type: boolean }
+        chatDisabled: { type: boolean }
+
+    SiteFeatureLocks:
+      type: object
+      description: Real captured shape (fixture site-feature-locks.json). Missing booleans default to false.
+      x-source: fixture
+      properties:
+        purchasesDisabled: { type: boolean }
+        paymentsDisabled: { type: boolean }
+        withdrawalsDisabled: { type: boolean }
+        resourceCreationDisabled: { type: boolean }
+        ordersDisabled: { type: boolean }
+        legalRequisitesHidden: { type: boolean }
+        userLocks: { $ref: "#/components/schemas/UserLocks" }
+
+    ChatSettings:
+      type: object
+      description: Opaque from the client - only `settings` is read.
+      properties:
+        settings:
+          type: object
+          additionalProperties: true
+
+    TrackPageViewRequest:
+      type: object
+      properties:
+        path:
+          type: string
+          description: pathname + "?"+search when a search string is present.
+        referrer:
+          type: [string, "null"]
+          description: document.referrer, or null (null on the 3-min heartbeat).
+      required: [path]
+
+    PickerUser:
+      type: object
+      properties:
+        id: { type: [number, string], description: compared via String(id). }
+        label: { type: string, description: display name (trimmed). }
+        avatarUrl: { type: [string, "null"] }
+
+    PickerResponse:
+      type: object
+      properties:
+        users:
+          type: array
+          items: { $ref: "#/components/schemas/PickerUser" }
+          description: Non-array/missing → treated as [].
+
+    PickerHaystacksRequest:
+      type: object
+      properties:
+        ids:
+          type: array
+          items: { type: number }
+          description: Author ids - positive ints, de-duped, sliced to max 120.
+      required: [ids]
+
+    PickerHaystacksResponse:
+      type: object
+      properties:
+        blobs:
+          type: object
+          description: Map userId → searchable name blob.
+          additionalProperties: { type: string }
+        avatars:
+          type: object
+          description: Map userId → avatar URL.
+          additionalProperties: { type: string }
+
+    ServiceAccountEnterRequest:
+      type: object
+      description: PIN optional; body omitted entirely if no PIN.
+      properties:
+        pin: { type: string }
+
+    ServiceAccountExitResponse:
+      type: object
+      properties:
+        role:
+          type: string
+          description: Staff role ∈ MODERATOR|SECURITY|DEVELOPER|AGENT|ACCOUNTANT → redirect /admin, else /.
+
+    EchoKeyWebhookResponse:
+      type: object
+      description: Dev echo endpoint shape (from i18n hint text).
+      properties:
+        status: { type: string }
+        message: { type: string }
+        key: { type: string, description: optional; echoed back. }
+
+    # =========================================================================
+    # Admin panel (/api/admin/*) + seller stats + dev-login + withdrawals.
+    # -------------------------------------------------------------------------
+    # Admin tables share a common shape: server field names, per-table status
+    # enums, and row values. Rows are backed by the fixtures (users-picker,
+    # orders, resources, seller-stats) or derived from them.
+    # =========================================================================
+
+    RoleCode:
+      type: string
+      description: Platform role code (STELIX_ROLE_META, level 1..10).
+      enum:
+        - NEWBIE
+        - VERIFIED
+        - TRUSTED
+        - SELLER
+        - SELLER_PLUS
+        - ACCOUNTANT
+        - MODERATOR
+        - SECURITY
+        - DEVELOPER
+        - AGENT
+
+    AdminPageMeta:
+      type: object
+      description: Pagination envelope shared by every admin list endpoint.
+      required: [total, page, pageSize]
+      properties:
+        total:
+          type: integer
+          description: Total rows matching the filters (before pagination).
+        page:
+          type: integer
+          description: Echoed 1-based page index.
+        pageSize:
+          type: integer
+          description: Echoed page size.
+
+    AdminUserRow:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        handle: { type: string }
+        role: { $ref: "#/components/schemas/RoleCode" }
+        status: { type: string, enum: [ACTIVE, BLOCKED, FROZEN] }
+        balance: { type: number }
+        payable: { type: number }
+        ordersCount: { type: integer }
+        purchasesCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        avatarUrl: { type: [string, "null"] }
+
+    AdminUsersResponse:
+      description: Paginated users table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminUserRow" }
+
+    AdminAccessResponse:
+      description: Users dataset for the Access section, plus the acting viewer's role.
+      allOf:
+        - $ref: "#/components/schemas/AdminUsersResponse"
+        - type: object
+          properties:
+            viewer:
+              type: object
+              properties:
+                role: { $ref: "#/components/schemas/RoleCode" }
+
+    AdminOrderRow:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        budget: { type: number }
+        customer: { type: string }
+        customerId: { type: integer }
+        executor: { type: [string, "null"] }
+        executorId: { type: [integer, "null"] }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AdminOrdersResponse:
+      description: Paginated orders table (verbatim from orders.json).
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminOrderRow" }
+
+    AdminPurchaseRow:
+      type: object
+      properties:
+        id: { type: string }
+        resourceId: { type: string }
+        title: { type: string }
+        buyer: { type: string }
+        buyerId: { type: integer }
+        price: { type: number }
+        fee: { type: number }
+        status: { type: string, enum: [PAID, REFUNDED, PENDING, DISPUTED] }
+        createdAt: { type: string, format: date-time }
+
+    AdminPurchasesResponse:
+      description: Paginated purchases table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminPurchaseRow" }
+
+    AdminResourceRow:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        author: { type: string }
+        authorId: { type: integer }
+        authorRole: { $ref: "#/components/schemas/RoleCode" }
+        price: { type: number }
+        sales: { type: integer }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: [string, "null"], format: date-time }
+
+    AdminResourcesResponse:
+      description: Paginated resources table (verbatim from resources.json).
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminResourceRow" }
+
+    AdminSellerRow:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/RoleCode" }
+        status: { type: string, enum: [ACTIVE, BLOCKED, FROZEN] }
+        count: { type: integer, description: Sales count. }
+        resourcesCount: { type: integer }
+        amount: { type: number, description: Turnover. }
+        payable: { type: number }
+
+    AdminSellersResponse:
+      description: Paginated sellers table (aggregated from resource authors).
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminSellerRow" }
+
+    AdminWithdrawalRow:
+      type: object
+      properties:
+        id: { type: string }
+        num: { type: integer }
+        userId: { type: integer }
+        identity: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/RoleCode" }
+        method: { type: string, enum: [CARD, SBP, CRYPTO, YOOMONEY] }
+        methodDetails: { type: string }
+        amount: { type: number }
+        status: { type: string, enum: [PENDING, PROCESSING, PAID, REJECTED] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AdminWithdrawalsResponse:
+      description: Paginated withdrawals table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminWithdrawalRow" }
+
+    AdminApplicationRow:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: integer }
+        identity: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/RoleCode" }
+        status: { type: string, enum: [PENDING, APPROVED, REJECTED] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AdminApplicationsResponse:
+      description: Paginated seller-application table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminApplicationRow" }
+
+    AdminBlacklistRow:
+      type: object
+      properties:
+        id: { type: integer }
+        identity: { type: string }
+        role: { $ref: "#/components/schemas/RoleCode" }
+        site: { type: string }
+        social: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AdminBlacklistResponse:
+      description: Paginated blacklist table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminBlacklistRow" }
+
+    AdminDeliveryRow:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: integer }
+        user: { type: string }
+        resourceId: { type: string }
+        resource: { type: string }
+        type: { type: string, enum: [FILE, DISCORD, LINK, APPLICATION, KEY] }
+        details: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    AdminDeliveriesResponse:
+      description: Paginated delivery-log table.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminDeliveryRow" }
+
+    AdminReviewRow:
+      type: object
+      description: Derived from resources with reviewsCount > 0 (no reviews fixture captured).
+      properties:
+        id: { type: integer }
+        reviewer:
+          type: object
+          properties:
+            name: { type: string }
+            role: { type: [string, "null"] }
+            id: { type: integer }
+        context:
+          type: object
+          properties:
+            resourceId: { type: string }
+            resourceSlug: { type: string }
+            resourceTitle: { type: string }
+            sellerLogin: { type: string }
+            sellerRole: { type: [string, "null"] }
+        comment: { type: string }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        reply: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: [string, "null"], format: date-time }
+
+    AdminReviewsResponse:
+      description: Reviews-moderation table (single page; total == items.length).
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/AdminReviewRow" }
+
+    AdminKpi:
+      type: object
+      properties:
+        key: { type: string }
+        label: { type: string }
+        value: { type: number }
+        format: { type: string, enum: [number, currency] }
+        delta: { type: number, description: Percent change vs previous period. }
+        trend: { type: string, enum: [up, down, flat] }
+
+    AdminStatsResponse:
+      type: object
+      description: Dashboard KPI tiles. Counters from seller-stats.json.
+      properties:
+        sellerCount: { type: integer }
+        userCount: { type: integer }
+        purchaseCount: { type: integer }
+        orderCount: { type: integer }
+        kpis:
+          type: array
+          items: { $ref: "#/components/schemas/AdminKpi" }
+
+    FinanceTransactionRow:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [sale, refund, payout] }
+        title: { type: string }
+        user: { type: string }
+        gross: { type: number }
+        fee: { type: number }
+        net: { type: number }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    AdminFinanceResponse:
+      description: Finance panel - period totals + paginated transactions.
+      allOf:
+        - $ref: "#/components/schemas/AdminPageMeta"
+        - type: object
+          properties:
+            period: { type: string, enum: [day, week, month, all] }
+            totals:
+              type: object
+              properties:
+                gross: { type: number }
+                fee: { type: number }
+                net: { type: number }
+                refunds: { type: number }
+                payouts: { type: number }
+                count: { type: integer }
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/FinanceTransactionRow" }
+
+    SellerStatsResponse:
+      type: object
+      description: Platform-wide counters. Real captured fixture (seller-stats.json).
+      x-source: fixture
+      properties:
+        sellerCount: { type: integer }
+        userCount: { type: integer }
+        purchaseCount: { type: integer }
+        orderCount: { type: integer }
+
+    OkIdResponse:
+      type: object
+      description: Mock acknowledgement echoing the affected id.
+      properties:
+        ok: { type: boolean }
+        id: { type: string }
+
+    WithdrawalsListResponse:
+      type: object
+      description: Seller withdrawals list (gated mock returns an empty array).
+      properties:
+        withdrawals:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+paths:
+
+  /api/auth/me:
+    get:
+      tags: [auth]
+      summary: Current user (bootstrap)
+      description: 'Hydrates the current user on app mount. Returns `{ user: null }` when unauthenticated (confirmed by fixture).'
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    oneOf:
+                      - $ref: "#/components/schemas/User"
+                      - type: "null"
+                required: [user]
+              examples:
+                unauthenticated:
+                  value: { "user": null }
+
+  /api/auth/balance:
+    get:
+      tags: [auth]
+      summary: Balance poller
+      description: Polled on mount, every 60s, and on window focus. Sent with the skip-loader header.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balance" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      summary: Log out
+      description: No body. On success the client clears the user and navigates to `/`. Body of the response is ignored.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (body ignored)
+
+  /api/auth/send-code:
+    post:
+      tags: [auth]
+      summary: Send login email code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SendCodeRequest" }
+      responses:
+        "200":
+          description: Code sent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SendCodeResponse" }
+        "400":
+          description: |
+            Error. `code` ∈ account_blocked | smtp_recipient | disposable_email | send_code_rate_limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/profile/email/verify-code:
+    post:
+      tags: [auth]
+      summary: Verify login/email code
+      description: Code-entry step of the email login gate; also the email-verification confirm. On success the client refreshes the user.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerifyCodeRequest" }
+      responses:
+        "200":
+          description: Verified (status only)
+        "400":
+          description: 'Error, e.g. "invalid or expired code". `code` may be "account_blocked".'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/profile:
+    get:
+      tags: [profile]
+      summary: Full profile bundle
+      description: |
+        Full profile object (superset of `/api/auth/me` user enriched with
+        settings-form data). Fetched in parallel with `/api/chat/settings` by
+        `fetchProfileSettingsBundle`. Sent with the skip-loader header.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/User"
+                  - type: object
+                    description: Plus additional settings-form fields.
+                    additionalProperties: true
+
+  /api/profile/settings:
+    get:
+      tags: [profile]
+      summary: Get profile settings
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings: { $ref: "#/components/schemas/ProfileSettings" }
+    patch:
+      tags: [profile]
+      summary: Update profile settings
+      description: Client reads `res.ok` only.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hidePersonalData: { type: boolean }
+              required: [hidePersonalData]
+      responses:
+        "200":
+          description: OK (status only)
+
+  /api/profile/language:
+    patch:
+      tags: [profile]
+      summary: Set UI language
+      description: Persists the chosen UI language. Client also writes the `SITE_LANGUAGE_COOKIE` cookie. Returns `res.ok`.
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LanguagePatchRequest" }
+      responses:
+        "200":
+          description: OK (status only)
+
+  /api/profile/oauth/discord:
+    get:
+      tags: [profile]
+      summary: Start Discord OAuth link (navigation)
+      description: |
+        Full-page navigation (not fetch) that starts the Discord OAuth link flow
+        (server redirects to Discord). OAuth returns to the site with
+        `?linked=<provider>` or `?error=<code>`. No JSON is consumed.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "302":
+          description: Redirect to the Discord OAuth authorization URL.
+
+  /api/profile/platform-welcome:
+    post:
+      tags: [profile]
+      summary: Platform welcome / legal consent
+      description: Consent gate. Throws `platform-welcome:<status>` on non-OK.
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlatformWelcomeRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Shape not further consumed by the client.
+                additionalProperties: true
+
+  /api/security/pin/verify:
+    post:
+      tags: [auth]
+      summary: Verify PIN (PIN gate)
+      description: Full-screen PIN gate shown when `user.hasPinSet` and the PIN is not yet verified this session.
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PinVerifyRequest" }
+      responses:
+        "200":
+          description: Verified (status only)
+        "400":
+          description: Incorrect PIN (may include attemptsLeft).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PinVerifyError" }
+        "429":
+          description: 'Too many attempts (`code: "pin_rate_limit"`).'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PinVerifyError" }
+
+  /api/geo/country:
+    get:
+      tags: [misc]
+      summary: Geo country / default currency
+      description: Picks the default display currency. On any failure the client falls back to RUB.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GeoCountry" }
+              examples:
+                us:
+                  value: { "countryCode": "US", "isRussia": false }
+
+  /api/ping:
+    get:
+      tags: [misc]
+      summary: Latency ping
+      description: 'Used for latency measurement. Real observed response is `204 No Content`. Fetched with `{ cache: "no-store", credentials: "same-origin" }`.'
+      security: []
+      responses:
+        "204":
+          description: No Content (body ignored; client measures round-trip time)
+
+  /api/cart:
+    get:
+      tags: [commerce]
+      summary: Get cart
+      description: Client splits `items` by `deferred`. Non-OK → treated as empty cart.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+    post:
+      tags: [commerce]
+      summary: Add to cart
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  title: Single
+                  properties:
+                    resourceId: { type: string }
+                  required: [resourceId]
+                - type: object
+                  title: Bulk
+                  properties:
+                    resourceIds:
+                      type: array
+                      items: { type: string }
+                  required: [resourceIds]
+      responses:
+        "200":
+          description: OK. Bulk add returns the count actually added.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  added: { type: number, description: Count actually added (bulk). }
+        "423":
+          $ref: "#/components/responses/Locked"
+    patch:
+      tags: [commerce]
+      summary: Update cart line (quantity / bucket)
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                resourceId: { type: string }
+                quantity: { type: number }
+                deferred: { type: boolean, description: Move between active/saved-for-later buckets. }
+              required: [resourceId]
+      responses:
+        "200":
+          description: OK
+        "423":
+          $ref: "#/components/responses/Locked"
+    delete:
+      tags: [commerce]
+      summary: Remove line / clear cart
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  title: Remove one
+                  properties:
+                    resourceId: { type: string }
+                  required: [resourceId]
+                - type: object
+                  title: Clear active
+                  properties:
+                    activeOnly: { type: boolean, enum: [true] }
+                  required: [activeOnly]
+                - type: object
+                  title: Clear saved-for-later
+                  properties:
+                    deferredOnly: { type: boolean, enum: [true] }
+                  required: [deferredOnly]
+      responses:
+        "200":
+          description: OK
+
+  /api/cart/summary:
+    get:
+      tags: [commerce]
+      summary: Cart totals (header badge)
+      description: Lightweight cart totals. Non-OK → null. Returns 401 when unauthenticated.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CartSummary" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/orders:
+    get:
+      tags: [commerce]
+      summary: List orders
+      description: |
+        Real captured shape (fixture orders.json). No client-side GET was found in
+        the bundles (order pages are server-rendered), but the endpoint returns
+        `{ orders: Order[] }`.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: "#/components/schemas/Order" }
+    post:
+      tags: [commerce]
+      summary: Create custom order
+      description: On success the client redirects to `/orders/{id}` (or `/orders` if no id).
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OrderCreateRequest" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+        "400":
+          description: Error (errCreateFailed fallback toast).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "423":
+          $ref: "#/components/responses/Locked"
+
+  /api/resources:
+    get:
+      tags: [commerce]
+      summary: Resource catalog
+      description: Real captured shape (fixture resources.json). Public catalog listing.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResourceList" }
+
+  /api/resources/{slug}:
+    get:
+      tags: [commerce]
+      summary: Resource detail
+      description: |
+        Detail endpoint for a single resource by slug or id. Not directly observed
+        as a client `fetch` (detail page is server-rendered) but implied by the
+        `/api/resources/` path prefix. Shape assumed to be a single `Resource`.
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+
+  /api/resources/catalog-viewed:
+    post:
+      tags: [commerce]
+      summary: Viewer "last viewed" enrichment
+      description: Enriches catalog cards with the viewer's last-viewed timestamps. Uses `credentials:"same-origin"`. Anonymous callers may get `{}`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CatalogViewedRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogViewedResponse" }
+
+  /api/combos:
+    get:
+      tags: [commerce]
+      summary: Combo (bundle) catalog
+      description: 'Real captured shape (fixture combos.json). Non-OK → `{ combos: [] }`.'
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComboList" }
+
+  /api/combos/{id}/balance:
+    post:
+      tags: [commerce]
+      summary: Buy combo with site balance
+      description: On success → redirect `/purchases`.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ComboBalanceRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComboBalanceResponse" }
+        "423":
+          $ref: "#/components/responses/Locked"
+
+  /api/combos/{id}/checkout-meta:
+    post:
+      tags: [commerce]
+      summary: Validate combo before external payment
+      description: On success the client navigates to the payment route with query params (client-side redirect, not an API call).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ComboCheckoutMetaRequest" }
+      responses:
+        "200":
+          description: OK (empty error → valid)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+
+  /api/combos/{id}/view:
+    post:
+      tags: [commerce]
+      summary: Track a unique combo view
+      description: Uses `credentials:"same-origin"`. No body.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComboViewResponse" }
+
+  /api/kassa:
+    get:
+      tags: [commerce]
+      summary: Checkout payment methods + FX rates
+      description: Loaded when the checkout page mounts. Non-OK → methods [] + load-failed state.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Kassa" }
+
+  /api/subscriptions/memberships:
+    get:
+      tags: [subscriptions]
+      summary: Buyer memberships + purchasable offerings
+      description: 'Hook `useBuyerSubscriptions`. `cache:"no-store"`. Non-OK → `{ subscriptions: [], offerings: [] }`.'
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MembershipsResponse" }
+    patch:
+      tags: [subscriptions]
+      summary: Toggle auto-renew
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subscriptionId: { type: string }
+                autoRenew: { type: boolean }
+              required: [subscriptionId, autoRenew]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: "#/components/schemas/Subscription" }
+        "400":
+          description: Failure (no `subscription`) → throws `error`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/subscriptions/offerings:
+    get:
+      tags: [subscriptions]
+      summary: List / lookup seller offerings
+      description: |
+        Multi-purpose GET.
+        - no query → seller's own offerings (also `usePublishedOfferings`);
+          real captured shape (fixture) `{ "offerings": [] }`.
+        - `?exists=1` → `{ "exists": boolean }` (real observed → `{"offerings":[]}`
+          for the published listing form; the exists form returns `exists`).
+        - `?id={id}` → `{ "offering": Offering | null }`.
+        Non-OK → `{ offerings: [] }`.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: exists
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: Return `{ exists }` instead of the offerings list.
+        - name: id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Return a single `{ offering }` by id.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OfferingsResponse"
+                  - type: object
+                    title: Exists
+                    properties:
+                      exists: { type: boolean }
+                  - type: object
+                    title: Single
+                    properties:
+                      offering:
+                        oneOf:
+                          - $ref: "#/components/schemas/Offering"
+                          - type: "null"
+              examples:
+                list:
+                  value: { "offerings": [] }
+                exists:
+                  value: { "offerings": [] }
+    post:
+      tags: [subscriptions]
+      summary: Create / upsert offering
+      description: Client passes the full Offering object verbatim (opaque editor payload).
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Offering" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offering: { $ref: "#/components/schemas/Offering" }
+        "400":
+          description: Error (throws `error`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+    patch:
+      tags: [subscriptions]
+      summary: Set offering published state
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: { type: string }
+                published: { type: boolean }
+              required: [id, published]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offering: { $ref: "#/components/schemas/Offering" }
+    delete:
+      tags: [subscriptions]
+      summary: Delete an offering
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Failure
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/subscriptions/subscribe:
+    post:
+      tags: [subscriptions]
+      summary: Subscribe to a seller plan
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscribeRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: "#/components/schemas/Subscription" }
+        "400":
+          description: Error (throws `error`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/purchases/{id}:
+    get:
+      tags: [commerce]
+      summary: Purchase detail (cover resolution)
+      description: "`cache:\"no-store\"`. Only cover/thumbnail fields are consumed by the client (coverPending flow)."
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Purchase" }
+
+  /api/payment/deposit-status/{id}:
+    get:
+      tags: [commerce]
+      summary: Poll deposit/payment status
+      description: "`cache:\"no-store\"`. Polled every 2000ms while `?awaitDeposit=<id>` is present. On `completed` → navigate to `redirectTo`."
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DepositStatus" }
+
+  /api/notifications:
+    get:
+      tags: [notifications]
+      summary: List notifications
+      description: Polled by the header bell on focus/visibility change. `{ credentials:"include", cache:"no-store" }`.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: unread
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: Only unread (the only variant seen in the bundle).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationsResponse" }
+        "429":
+          description: Rate limited.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  retryAfterSec: { type: number, description: Else falls back to Retry-After header, default 60. }
+
+  /api/notifications/read:
+    post:
+      tags: [notifications]
+      summary: Mark notifications read
+      description: Body `{ ids }` marks specific, `{}` marks ALL. Response body not consumed.
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationsReadRequest" }
+      responses:
+        "200":
+          description: OK (status only)
+
+  /api/site-news:
+    get:
+      tags: [notifications]
+      summary: Site-news unread count
+      description: |
+        `?unreadCount=1` returns `{ unreadCount }`. `{ credentials:"include",
+        cache:"no-store" }`. Returns 401 when unauthenticated.
+        A plain-list variant (returning the news items) almost certainly exists
+        but is consumed server-side and is not observable from the client.
+       
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: unreadCount
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SiteNewsUnread" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/site-feature-locks:
+    get:
+      tags: [misc]
+      summary: Site feature locks
+      description: Real captured shape (fixture site-feature-locks.json). `{ cache:"no-store" }`, no explicit credentials. Missing booleans default to false.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SiteFeatureLocks" }
+
+  /api/chat/settings:
+    get:
+      tags: [misc]
+      summary: Chat settings
+      description: Part of the profile-settings bundle. Only `settings` is read (opaque). Sent with the skip-loader header. Returns 401 when unauthenticated.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SkipSlowFetchHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatSettings" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/chat/list:
+    get:
+      tags: [misc]
+      summary: Chat list
+      description: Seen as a path literal in the chunks; request/response shapes not observable from the client.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (shape unknown)
+
+  /api/secure-chat-download:
+    get:
+      tags: [misc]
+      summary: Secure chat attachment download
+      description: |
+        Not `fetch`-ed; rendered directly as `<img src>` / download href. Streams a
+        chat attachment/file (binary). The full URL (a signed token/id) arrives in
+        chat-message attachment data and is used verbatim - the client never builds
+        the query string.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: File bytes (image or downloadable attachment).
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+
+  /api/track/page-view:
+    post:
+      tags: [misc]
+      summary: Page-view analytics beacon
+      description: |
+        Preferred transport `navigator.sendBeacon`; fallback `fetch` with
+        `keepalive:true, credentials:"same-origin"`. Fired on every client route
+        change and re-fired on a 3-min heartbeat (`referrer: null`).
+        Fire-and-forget - response not read.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TrackPageViewRequest" }
+      responses:
+        "204":
+          description: Accepted (response not read)
+
+  /api/users/picker:
+    get:
+      tags: [admin]
+      summary: User picker autocomplete
+      description: |
+        Reusable user-picker (admin/staff assignment, seller selection). 280ms
+        debounce, AbortController. `q=<id>` resolves a single preselected user.
+        Non-array/missing `users` → [].
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: Free-text search (trimmed); also a numeric id to resolve one user.
+        - name: staff
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: Restrict to staff (mutually exclusive with sellerTier/sellers).
+        - name: sellerTier
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: Restrict to seller-tier users.
+        - name: sellers
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: Restrict to sellers.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PickerResponse" }
+
+  /api/users/picker-haystacks:
+    post:
+      tags: [admin]
+      summary: Batch author search haystacks + avatars
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PickerHaystacksRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PickerHaystacksResponse" }
+
+  /api/admin/impersonate:
+    post:
+      tags: [admin]
+      summary: Start impersonation
+      description: |
+        Must exist (an admin picks a user) but is not present in the client chunks
+        - likely triggered from an admin page/server action. Request/response
+        shapes unknown.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (shape unknown)
+    delete:
+      tags: [admin]
+      summary: Stop impersonating
+      description: No body. On ok → navigate to `/admin/users`; otherwise `location.reload()`.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (status only)
+
+  /api/admin/service-account:
+    post:
+      tags: [admin]
+      summary: Enter service-account mode
+      description: Optionally PIN-gated. `403` → "pin_wrong"; other non-ok → "failed"; ok → reload. Body omitted if no PIN.
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceAccountEnterRequest" }
+      responses:
+        "200":
+          description: OK → client reloads.
+        "403":
+          description: Wrong PIN → "pin_wrong".
+    delete:
+      tags: [admin]
+      summary: Leave service-account mode
+      description: Routes by the returned role - staff role → `/admin`, else `/`.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceAccountExitResponse" }
+
+  /api/webhooks/{provider}:
+    post:
+      tags: [webhooks]
+      summary: Incoming payment provider webhook
+      description: |
+        Server-to-server callback hit by an external payment provider, not the
+        browser. Body is a provider-specific signed payload (opaque). Method is
+        provider-defined (typically POST; some providers use GET redirects).
+        Response is a provider-specific ack, not consumed by the browser.
+        `tochka` uses this single path for both incoming and payout.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: Payment provider slug.
+          schema:
+            type: string
+            enum:
+              - yoomoney
+              - yookassa
+              - heleket
+              - freekassa
+              - betatransfer
+              - skinpay
+              - skinsback
+              - robokassa
+              - paypalych
+              - tbank
+              - anypay
+              - tome
+              - platega
+              - cardlink
+              - paymaster
+              - tochka
+      requestBody:
+        required: false
+        description: Provider-specific signed payload (opaque).
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Provider-specific ack (not consumed by the client).
+        "404":
+          description: 'Unknown provider slug → `{ error: "unknown_provider" }`.'
+    get:
+      tags: [webhooks]
+      summary: Incoming payment provider webhook (GET self-test)
+      description: |
+        Some providers configure a GET self-test / redirect ping to the same path.
+        Same provider slug set as POST. Acknowledged with 200 for a known provider,
+        404 `unknown_provider` otherwise.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: Payment provider slug (same enum as POST on this path).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Provider-specific ack (not consumed by the client).
+        "404":
+          description: 'Unknown provider slug → `{ error: "unknown_provider" }`.'
+
+  /api/webhooks/payout/{provider}:
+    post:
+      tags: [webhooks]
+      summary: Payout provider webhook
+      description: |
+        Server-to-server payout status callback. Body/method provider-defined and
+        opaque. Note: `tochka` payout maps to the non-`/payout/` path
+        (`/api/webhooks/tochka`).
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: Payout provider slug.
+          schema:
+            type: string
+            enum:
+              - yookassa
+              - heleket
+              - tbank
+              - yoomoney
+              - paypalych
+              - robokassa
+              - anypay
+              - tome
+              - platega
+      requestBody:
+        required: false
+        description: Provider-specific payout status callback (opaque).
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Provider-specific ack (not consumed by the client).
+        "404":
+          description: 'Unknown provider slug → `{ error: "unknown_provider" }`.'
+    get:
+      tags: [webhooks]
+      summary: Payout provider webhook (GET self-test)
+      description: |
+        GET self-test / redirect ping variant. Same payout provider slug set as
+        POST. Acknowledged with 200 for a known provider, 404 `unknown_provider`
+        otherwise.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: Payout provider slug (same enum as POST on this path).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Provider-specific ack (not consumed by the client).
+        "404":
+          description: 'Unknown provider slug → `{ error: "unknown_provider" }`.'
+
+  /api/dev/echo-key-webhook:
+    get:
+      tags: [webhooks]
+      summary: Dev echo webhook helper
+      description: |
+        Development echo endpoint a seller can put in a resource's webhook URL so
+        the server's "test webhook" flow has something to call. Appears only in
+        i18n hint text.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EchoKeyWebhookResponse" }
+    post:
+      tags: [webhooks]
+      summary: Dev echo webhook helper
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EchoKeyWebhookResponse" }
+
+  /api/discord/user-mentions:
+    get:
+      tags: [misc]
+      summary: Discord user mentions
+      description: Seen as a path literal in the chunks; request/response shapes not observable from the client.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (shape unknown)
+
+  /api/presence:
+    get:
+      tags: [misc]
+      summary: Presence
+      description: Seen as a path literal in the chunks; request/response shapes not observable from the client.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK (shape unknown)
+
+  /api/search:
+    get:
+      tags: [misc]
+      summary: Global search
+      description: Seen as a path literal in the chunks; request/response shapes not observable from the client.
+      security: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: Search query.
+      responses:
+        "200":
+          description: OK (shape unknown)
+
+  /api/seller/stats:
+    get:
+      tags: [misc]
+      summary: Platform-wide counters
+      description: |
+        Public-ish platform counters (`sellerCount`, `userCount`, `purchaseCount`,
+        `orderCount`). Discovered live during the authenticated capture; returns the
+        same real captured stats whether or not a session is present (200 either way).
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SellerStatsResponse" }
+
+  /api/auth/dev-login:
+    post:
+      tags: [auth]
+      summary: Start a mock session (dev switch)
+      description: |
+        Local dev switch only - no credential check. Sets the httpOnly
+        `mock_session` cookie (path=/, 1 year) so the mock API begins serving the
+        real captured authed fixtures.
+      security: []
+      responses:
+        "200":
+          description: OK - session cookie set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+
+  /api/withdrawals:
+    get:
+      tags: [commerce]
+      summary: List seller withdrawals
+      description: |
+        Representative withdrawals-area endpoint (seller payouts). The withdrawals
+        page is server-rendered, so no client fetch survives in the mirror; this is
+        a contract-satisfying gated mock (`401` when logged out, empty list otherwise).
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WithdrawalsListResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [commerce]
+      summary: Request a withdrawal
+      description: 'Request a payout (opaque body); mock acknowledges with `{ ok: true }`.'
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/users:
+    get:
+      tags: [admin]
+      summary: Users table
+      description: Paginated users table.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - name: status
+          in: query
+          required: false
+          description: Filter by user status.
+          schema: { type: string, enum: [ACTIVE, BLOCKED, FROZEN] }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminUsersResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/access:
+    get:
+      tags: [admin]
+      summary: Access-management list
+      description: |
+        Per-user access-management list for the Access section (Block C). Aliases
+        the users dataset and echoes the acting admin's viewer role.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - name: status
+          in: query
+          required: false
+          description: Filter by user status.
+          schema: { type: string, enum: [ACTIVE, BLOCKED, FROZEN] }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccessResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/sellers:
+    get:
+      tags: [admin]
+      summary: Sellers table
+      description: Paginated sellers table (aggregated from resource authors).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - name: status
+          in: query
+          required: false
+          description: Filter by seller status.
+          schema: { type: string, enum: [ACTIVE, FROZEN] }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminSellersResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/orders:
+    get:
+      tags: [admin]
+      summary: Orders table
+      description: Paginated orders table (verbatim from orders.json).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - $ref: "#/components/parameters/AdminListStatus"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminOrdersResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/purchases:
+    get:
+      tags: [admin]
+      summary: Purchases table
+      description: Paginated purchases table.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - name: status
+          in: query
+          required: false
+          description: Filter by purchase status.
+          schema: { type: string, enum: [PAID, REFUNDED, PENDING, DISPUTED] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminPurchasesResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/resources:
+    get:
+      tags: [admin]
+      summary: Resources table
+      description: Paginated resources table (verbatim from resources.json).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - $ref: "#/components/parameters/AdminListQ"
+        - $ref: "#/components/parameters/AdminListStatus"
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminResourcesResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/withdrawals:
+    get:
+      tags: [admin]
+      summary: Withdrawals table
+      description: Paginated withdrawals table.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - name: q
+          in: query
+          required: false
+          description: Free-text search (identity/email/method details/num).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Filter by withdrawal status.
+          schema: { type: string, enum: [PENDING, PROCESSING, PAID, REJECTED] }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminWithdrawalsResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/applications:
+    get:
+      tags: [admin]
+      summary: Seller applications table
+      description: Paginated seller-application table.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - name: q
+          in: query
+          required: false
+          description: Free-text search (identity/email).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Filter by application status.
+          schema: { type: string, enum: [PENDING, APPROVED, REJECTED] }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminApplicationsResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/blacklist:
+    get:
+      tags: [admin]
+      summary: Blacklist table
+      description: Paginated blacklist table.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - name: q
+          in: query
+          required: false
+          description: Free-text search (identity/site/social/id).
+          schema: { type: string }
+        - $ref: "#/components/parameters/AdminListRole"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminBlacklistResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/deliveries:
+    get:
+      tags: [admin]
+      summary: Delivery-log table
+      description: Paginated delivery-log table. `status` filters by delivery type.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - name: q
+          in: query
+          required: false
+          description: Free-text search (user/resource/details).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Filter by delivery type.
+          schema: { type: string, enum: [FILE, DISCORD, LINK, APPLICATION, KEY] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminDeliveriesResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/reviews:
+    get:
+      tags: [admin]
+      summary: Reviews-moderation table
+      description: |
+        Reviews-moderation table. No reviews fixture was captured, so rows are
+        deterministically derived from resources with `reviewsCount > 0`, with
+        reviewers drawn from the real users picker. Returns a single page
+        (`total == items.length`).
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminReviewsResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/reviews/{id}:
+    delete:
+      tags: [admin]
+      summary: Delete a review
+      description: Remove a review (mock; row is dropped optimistically client-side).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Review id.
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OkIdResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/stats:
+    get:
+      tags: [admin]
+      summary: Dashboard KPI tiles
+      description: |
+        Dashboard KPI tiles. Counters from seller-stats.json; trend deltas are computed.
+      security: [{ cookieAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminStatsResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/finance:
+    get:
+      tags: [admin]
+      summary: Finance panel
+      description: |
+        Finance panel - period totals + paginated transactions (derived from
+        purchases + withdrawals).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AdminListPage"
+        - $ref: "#/components/parameters/AdminListPageSize"
+        - name: q
+          in: query
+          required: false
+          description: Free-text search (title/user/id).
+          schema: { type: string }
+        - $ref: "#/components/parameters/AdminListStatus"
+        - name: period
+          in: query
+          required: false
+          description: Aggregation window (default all).
+          schema: { type: string, enum: [day, week, month, all], default: all }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminFinanceResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/admin/sessions/{id}/terminate:
+    post:
+      tags: [admin]
+      summary: Terminate a user session
+      description: |
+        End a user session (mock no-op; the Activity section drops the row locally
+        regardless).
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session id.
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OkIdResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
